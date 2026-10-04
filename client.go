@@ -78,6 +78,9 @@ func (r *coordxResolver) Resolve(ctx context.Context, desc string) (discovery.Re
 	}
 	// Cacheable 置 false：实例列表随注册中心变动，不进 kitex 的结果缓存，
 	// 每次都重新走一次 coordx 发现（代价是一次健康查询，换来热度数据的新鲜度）。
+	// 已知取舍：本包未实测过 resolve 的调用频次（是否真按每请求触发取决于
+	// kitex 的版本与调用形态），因此这里的「一次健康查询」只是量级估计，
+	// 不是实测值；若后续实测发现频次要命，再考虑置 true 并给出缓存过期策略。
 	return discovery.Result{Cacheable: false, CacheKey: service, Instances: instances}, nil
 }
 

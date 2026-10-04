@@ -1,8 +1,12 @@
 package rpcx
 
 import (
+	"reflect"
 	"testing"
 	"time"
+
+	"github.com/cloudwego/kitex/client"
+	kitextracing "github.com/kitex-contrib/obs-opentelemetry/tracing"
 )
 
 func TestBuildServerOptionsIncludesAddr(t *testing.T) {
@@ -63,13 +67,41 @@ func TestBuildOptionsAttachesCoordx(t *testing.T) {
 	}
 }
 
+// kitex 的 Option 是闭包，拿 reflect 的 code pointer 就能把「谁在前」钉住：
+// 同一处 func literal 每次调用返回的闭包共享同一个 code pointer，
+// 因此可以拿一份「已知来源」的 option 去比对 BuildClientOptions 产出的列表。
+func optionCodePtr(o client.Option) uintptr { return reflect.ValueOf(o.F).Pointer() }
+
+// suite 必须先注册（内层、后执行），本包的 ClientSpanMiddleware 后注册（外层、
+// 先执行）：只有本包的 span 先建好，被注入给下游的才是它。这是 README 里
+// 唯一不可换的不变量，也是 detachKitexSpan 能认出 kitex span 的前提。
 func TestBuildClientOptionsTraceOrder(t *testing.T) {
-	// suite 与 ClientSpanMiddleware 必须同时出现（顺序 = 注册顺序）：
-	// 少了 middleware 就会出现 2026-10-02 实测的「span 树断成两棵子树」。
 	traced := BuildClientOptions(ClientOptions{ServiceName: "bff", TraceEnabled: true})
 	plain := BuildClientOptions(ClientOptions{ServiceName: "bff"})
 	if got := len(traced) - len(plain); got != 2 {
 		t.Fatalf("tracing adds %d options, want 2 (suite + ClientSpanMiddleware)", got)
+	}
+
+	suitePtr := optionCodePtr(client.WithSuite(kitextracing.NewClientSuite()))
+	mwPtr := optionCodePtr(client.WithMiddleware(ClientSpanMiddleware()))
+	if suitePtr == mwPtr {
+		t.Fatalf("suite 与 middleware 的 code pointer 相同（%#x），无法区分顺序", suitePtr)
+	}
+
+	iSuite, iMW := -1, -1
+	for i, opt := range traced {
+		switch optionCodePtr(opt) {
+		case suitePtr:
+			iSuite = i
+		case mwPtr:
+			iMW = i
+		}
+	}
+	if iSuite < 0 || iMW < 0 {
+		t.Fatalf("未在 %d 个选项里定位到 suite(%d)/middleware(%d)", len(traced), iSuite, iMW)
+	}
+	if iSuite > iMW {
+		t.Fatalf("注册顺序反了：suite 在 %d、ClientSpanMiddleware 在 %d，want suite 在前", iSuite, iMW)
 	}
 }
 

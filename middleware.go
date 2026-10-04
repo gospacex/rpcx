@@ -15,6 +15,7 @@ package rpcx
 
 import (
 	"context"
+	"strings"
 
 	"github.com/bytedance/gopkg/cloud/metainfo"
 	"github.com/cloudwego/kitex/pkg/endpoint"
@@ -87,16 +88,46 @@ func injectSpanContext(ctx context.Context) context.Context {
 // detachKitexSpan 把 ctx 当前的 span 换成「只保留其 SpanContext」的形态，
 // 使后续 Start 以调用方的业务 span 为父，而不是 kitex 那个不落地的 span。
 //
-// 若当前 span 不是 SDK span（拿不到 ReadOnlySpan.Parent），就沿用它自身的
-// SpanContext——此时它是调用方放进 ctx 的业务 span，本来就是想要的父。
+// 只有判定为 kitex span（见 isKitexSpan）才上跳一级到它的 Parent；判定不出
+// 就沿用当前 span 自身的 SpanContext 做父——此时它多半就是调用方放进 ctx 的
+// 业务 span，本来就是想要的父。
 func detachKitexSpan(ctx context.Context) context.Context {
+	// ctx 里没有 span 时 SpanFromContext 返回 noopSpan（非 nil），
+	// 此时 SpanContext 无效、Parent 无效，会走「沿用」分支产出根 span。
 	cur := oteltrace.SpanFromContext(ctx)
-	if cur == nil {
-		return ctx
-	}
 	parent := cur.SpanContext()
-	if ro, ok := cur.(sdktrace.ReadOnlySpan); ok && ro.Parent().IsValid() {
-		parent = ro.Parent()
+	if isKitexSpan(cur) {
+		parent = cur.(sdktrace.ReadOnlySpan).Parent()
 	}
 	return oteltrace.ContextWithSpanContext(ctx, parent)
+}
+
+// kitexSpanScopeMarkers 判定 kitex span 用的 instrumentation scope 名标记。
+//
+// 2026-10-05 实测（obs-opentelemetry v0.3.0，走 NewClientSuite 真实装配、
+// 用 tracetest 录制）：suite 产出的 span 其
+// InstrumentationScope().Name == "github.com/kitex-contrib/obs-opentelemetry"、
+// Version == "semver:0.39.0"。这里按「含标记串」而非全串相等来判定，上游
+// 换版本号不会让判定失效（失效的后果是静默回到断链）。
+var kitexSpanScopeMarkers = []string{"obs-opentelemetry", "kitex"}
+
+// isKitexSpan 判断当前 span 是否 kitex suite 产出的那个不落地的 span。
+//
+// 判定依据是「身份」而不是「类」：只看 span 是不是 SDK ReadOnlySpan（旧写法）
+// 等价于跳过任何 SDK span，一旦 ctx 里的当前 span 恰好就是调用方的业务 span
+// （suite 升级后不在该位置建 span、或 tracer 关掉而中间件仍在链上），就会被
+// 误当成 kitex span 上跳一级，client span 挂到祖父节点——正是本包要修的断链，
+// 且静默发生。因此这里只认 kitex 自己的 scope 名，认不出就返回 false。
+func isKitexSpan(span oteltrace.Span) bool {
+	ro, ok := span.(sdktrace.ReadOnlySpan)
+	if !ok || !ro.Parent().IsValid() {
+		return false
+	}
+	name := ro.InstrumentationScope().Name
+	for _, m := range kitexSpanScopeMarkers {
+		if strings.Contains(name, m) {
+			return true
+		}
+	}
+	return false
 }
