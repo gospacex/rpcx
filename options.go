@@ -54,6 +54,9 @@ type ServerOptions struct {
 	ExitWait time.Duration
 	// ReadWriteTimeout 连接读写超时，0 用 defaultReadWriteTimeout
 	ReadWriteTimeout time.Duration
+	// MetricsEnabled 是否挂 RPC 服务端指标中间件（见 metrics.go）。
+	// 零值 false：与出向一致，默认不挂，既有行为不变。
+	MetricsEnabled bool
 }
 
 // ClientOptions kitex 客户端装配参数
@@ -75,6 +78,18 @@ type ClientOptions struct {
 	RPCTimeout time.Duration
 	// ConnectTimeout 建连超时，0 用 defaultConnectTimeout
 	ConnectTimeout time.Duration
+	// DownstreamService 被调服务名（与调用方 NewClient 时传的服务名一致）。
+	// 用途：服务级熔断 key（见 governance.go）与后续诊断；为空时服务级熔断
+	// 退到 kitex 自己的缺省阈值，实例级不受影响。
+	DownstreamService string
+	// MetricsEnabled 是否挂 RPC 指标中间件（见 metrics.go）。
+	MetricsEnabled bool
+
+	// 出向治理三件套。**零值全关**，产出的选项列表与引入治理面之前逐字相同。
+	// 语义、边界与坑见 governance.go 的包注释。
+	Retry          RetryOptions
+	CircuitBreaker CircuitBreakerOptions
+	LoadBalancer   LoadBalancer
 }
 
 func (o ServerOptions) exitWait() time.Duration {
@@ -133,6 +148,10 @@ func BuildServerOptions(o ServerOptions) []server.Option {
 	if o.TraceEnabled {
 		opts = append(opts, server.WithSuite(kitextracing.NewServerSuite()))
 	}
+	// 指标中间件放最后 = 链路最外层：量到的是「这一次入站调用的总代价」。
+	if o.MetricsEnabled {
+		opts = append(opts, server.WithMiddleware(ServerMetricMiddleware()))
+	}
 	return opts
 }
 
@@ -148,14 +167,25 @@ func BuildServerOptions(o ServerOptions) []server.Option {
 // 被注入的才是它（详见 middleware.go 的实测记录）。
 //
 // 与服务端同理：coordx.NewDiscover 出错时静默跳过，不产出 WithResolver。
+//
+// 除上面这些，本函数还会按配置挂出向治理三件套（熔断 / 失败重试 / 负载均衡，
+// 见 governance.go）与 RPC 指标中间件（见 metrics.go）；三者开关默认全关。
 func BuildClientOptions(o ClientOptions) []client.Option {
 	opts := []client.Option{
 		client.WithRPCTimeout(o.rpcTimeout()),
 		client.WithConnectTimeout(o.connectTimeout()),
 	}
+	// 出向治理三件套（熔断 / 重试 / 负载均衡）：默认全关，见 governance.go。
+	opts = append(opts, governanceOptions(o)...)
 	if o.TraceEnabled {
 		opts = append(opts, client.WithSuite(kitextracing.NewClientSuite()))
 		opts = append(opts, client.WithMiddleware(ClientSpanMiddleware()))
+	}
+	// 指标中间件**最后**注册 = 链路最外层（先注册的在内层、后执行）：
+	// 它量的是「这一次业务调用的总代价」，含被包在内层的重试。放内层会量成
+	// "最后一次尝试的耗时" —— 排查超时时最容易看错的那个数。
+	if o.MetricsEnabled {
+		opts = append(opts, client.WithMiddleware(ClientMetricMiddleware()))
 	}
 	switch {
 	case o.RegistryAddr != "":
